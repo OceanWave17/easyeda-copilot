@@ -12,8 +12,58 @@ import { managedMutationHandler, toolHandler } from './handler';
 import { isMissingPartUuid, PartUuidStruct } from '@copilot/shared/types/lcsc';
 import { createComponentPreview, needsSymbolPreview } from '../utils/component-preview';
 import { readOtherPageSignals } from '../utils/other-page-signals';
+import {
+    compareReadback, type ExpectedNetlist, limited, readbackToExpected, unannotatedDesignators,
+} from '../utils/netlist';
 
 type SchematicBlocks = Record<string, string[]>;
+
+const READBACK_LIMIT = 40;
+
+/** Pins requested by a circuit modification, as an expectation for page readback. */
+function requestedConnections(circuit: CircuitMod): ExpectedNetlist {
+    const expected: ExpectedNetlist = {};
+    for (const component of circuit.add_components) {
+        expected[baseDesignator(component.designator)] = Object.fromEntries(
+            component.pins.map(pin => [String(pin.pin_number), pin.signal_name ?? '']),
+        );
+    }
+    for (const connection of circuit.external_connect ?? []) {
+        const designator = baseDesignator(connection.designator);
+        expected[designator] = { ...expected[designator], [String(connection.pin_number)]: connection.signal_name };
+    }
+    return expected;
+}
+
+/**
+ * Read the current page back and compare it with what the change should have produced.
+ * A completed assembly is not proof of connectivity: device lookups can fail silently and
+ * leave parts unannotated or unconnected.
+ */
+async function verifyCurrentPage(bridge: Bridge, expected: ExpectedNetlist, removed: string[] = []) {
+    const readback = await bridge.requestEasyEda('get-schematic') as ExplainCircuit;
+    const comparison = compareReadback(expected, readback.components);
+    const present = new Set(readback.components.map(component => baseDesignator(component.designator)));
+    const stillPresent = removed.map(baseDesignator).filter(designator => present.has(designator) && !(designator in expected));
+    const unannotated = unannotatedDesignators(readback.components);
+    const ok = comparison.ok && !stillPresent.length && !unannotated.length;
+    const hints: string[] = [];
+    if (!readback.components.length && Object.keys(expected).length) {
+        hints.push('Readback returned no components. EasyEDA may be unable to fetch device information '
+            + '(offline mode or a local project); use half-online mode with a cloud project.');
+    }
+    if (unannotated.length) hints.push('Some designators are unannotated; device information may not have loaded.');
+    return {
+        ok,
+        checked_components: comparison.checked_components,
+        checked_pins: comparison.checked_pins,
+        ...(comparison.missing_components.length ? { missing_components: comparison.missing_components } : {}),
+        ...(comparison.mismatches.length ? { mismatches: limited(comparison.mismatches, READBACK_LIMIT) } : {}),
+        ...(stillPresent.length ? { not_removed: stillPresent } : {}),
+        ...(unannotated.length ? { unannotated_designators: unannotated } : {}),
+        ...(hints.length ? { hints } : {}),
+    };
+}
 
 function baseDesignator(value: string) {
     return value.trim().replace(/\.\d+$/, '');
@@ -206,11 +256,16 @@ export function registerCircuitTools(server: McpServer, bridge: Bridge) {
                 assemblyOptions: { otherPageSignals } });
             const assembled = await bridge.requestEasyEda('assemble-circuit', result as Record<string, unknown>);
             const sheetSpace = sheetSpaceNotice(assembled);
-            return textResult({
-                message: 'Circuit sent to EasyEDA for assembly.',
+            const verification = await verifyCurrentPage(bridge, requestedConnections(circuit), circuit.rm_components ?? []);
+            const toolResult = await textResult({
+                message: verification.ok
+                    ? 'Circuit assembled; page readback matches every requested connection.'
+                    : 'Circuit assembly finished, but the page readback does NOT match the request. Inspect verification before continuing.',
                 checkpointId: (assembled as { checkpointId?: string }).checkpointId,
+                verification,
                 ...(sheetSpace ? { sheetSpace } : {}),
             });
+            return verification.ok ? toolResult : { ...toolResult, isError: true };
         }),
     );
 
@@ -309,12 +364,17 @@ export function registerCircuitTools(server: McpServer, bridge: Bridge) {
                 expectedDesignators: [...components.keys()],
             });
             const sheetSpace = sheetSpaceNotice(assembled);
-
-            return textResult({
-                message: 'Current EasyEDA schematic page beautified.',
+            // Beautify rebuilds the whole page; its connectivity must be unchanged.
+            const verification = await verifyCurrentPage(bridge, readbackToExpected(inputCircuit.components));
+            const toolResult = await textResult({
+                message: verification.ok
+                    ? 'Current EasyEDA schematic page beautified; connectivity is unchanged.'
+                    : `Beautify changed page connectivity. Restore checkpoint ${checkpointId} unless the differences are intended.`,
                 checkpointId,
+                verification,
                 ...(sheetSpace ? { sheetSpace } : {}),
             });
+            return verification.ok ? toolResult : { ...toolResult, isError: true };
         }),
     );
 
