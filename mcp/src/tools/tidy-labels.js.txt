@@ -84,18 +84,43 @@ for (const t of texts) {
     if (!dryRun) await eda.sch_PrimitiveAttribute.modify(t.id, { valueVisible: false });
 }
 
-// 2. Move what still overlaps to the nearest free offset.
+// 2. Move what still overlaps to the nearest free offset. A moved text must still read as
+// belonging to its owner: a net name only slides along its own wire segment (never onto a
+// neighbouring pin's row), and a designator/value stays closer to its own symbol than to any other.
 const offsets = [];
 for (let dx = -maxShift; dx <= maxShift; dx += step)
     for (let dy = -maxShift; dy <= maxShift; dy += step)
         if (dx || dy) offsets.push([dx, dy]);
 offsets.sort((a, b) => Math.hypot(...a) - Math.hypot(...b));
 
+const center = b => [(b.x1 + b.x2) / 2, (b.y1 + b.y2) / 2];
+const boxDistance = (b, [x, y]) => Math.hypot(Math.max(b.x1 - x, 0, x - b.x2), Math.max(b.y1 - y, 0, y - b.y2));
+const segDistance = ([x1, y1, x2, y2], [x, y]) => {
+    const lx = x2 - x1, ly = y2 - y1, len = lx * lx + ly * ly;
+    const k = len ? Math.max(0, Math.min(1, ((x - x1) * lx + (y - y1) * ly) / len)) : 0;
+    return Math.hypot(x - (x1 + k * lx), y - (y1 + k * ly));
+};
+const ownSegment = t => t.segs.reduce((best, s) => segDistance(s, center(t.b)) < segDistance(best, center(t.b)) ? s : best);
+
+const allowed = (t, dx, dy) => {
+    const c = center(shift(t.b, dx, dy));
+    if (t.key === 'NetName') {
+        const [x1, y1, x2, y2] = ownSegment(t);
+        if (y1 === y2) return dy === 0 && c[0] >= Math.min(x1, x2) && c[0] <= Math.max(x1, x2);
+        if (x1 === x2) return dx === 0 && c[1] >= Math.min(y1, y2) && c[1] <= Math.max(y1, y2);
+        return false;
+    }
+    const own = bodies.find(o => o.owner === t.owner);
+    if (!own) return true;
+    const mine = boxDistance(own.b, c);
+    return bodies.every(o => o === own || boxDistance(o.b, c) > mine);
+};
+
 let moved = 0;
 const unresolved = [];
 for (const t of overlapping()) {
     if (!t.movable) { unresolved.push(`${t.owner}/${t.key}`); continue; }
-    const free = offsets.find(([dx, dy]) => !blocked(t, shift(t.b, dx, dy), new Set()));
+    const free = offsets.find(([dx, dy]) => allowed(t, dx, dy) && !blocked(t, shift(t.b, dx, dy), new Set()));
     if (!free) { unresolved.push(`${t.owner}/${t.key}`); continue; }
     const [dx, dy] = free;
     t.b = shift(t.b, dx, dy);
