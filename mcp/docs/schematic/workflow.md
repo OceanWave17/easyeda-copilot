@@ -18,8 +18,9 @@ For local context missing from the netlist, use [schematic groups](groups.md): `
    - requires every component on the current page, grouped exactly once.
    - Keep `draw_block_box: false` unless the user wants Copilot-managed functional boxes and labels.
    - `auto_resize_page` defaults to `true`: shrink or grow a standard drawing sheet to the smallest fitting format (A4–A0), leaving room for its border and title block. Custom or inconsistent drawing sheets retain their size. Set it to `false` to keep the current sheet size.
-6. Follow [schematic verification](verification.md); reread the page when exact connectivity readback is needed.
-7. Report the affected page and stop at the schematic boundary.
+6. Run `tidy_labels` after beautify. It hides a wire's net name where a port or flag of the same net already shows it, and moves overlapping designators, values and net names to free space. Connectivity is checked before and after; ports, symbols and wires do not move.
+7. Follow [schematic verification](verification.md); reread the page when exact connectivity readback is needed.
+8. Report the affected page and stop at the schematic boundary.
 
 Beautify creates a checkpoint and restores it automatically if destructive page replacement fails. A successful beautify still changes the visual placement of the entire page. Warn the user first when preserving a manually arranged page matters.
 

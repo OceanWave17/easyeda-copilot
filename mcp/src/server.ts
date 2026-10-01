@@ -12,6 +12,7 @@ import { registerOperationTools } from './tools/operations';
 import { registerProjectTools } from './tools/projects';
 import { registerExecuteJsTools } from './tools/execute-js';
 import { registerVerifyTools } from './tools/verify';
+import { registerLabelTools } from './tools/labels';
 import { DOCS_DIR, MCP_VERSION, SKILL_DOC_PATH } from './utils/dirs';
 
 const SKILL_DOC_URI = 'easyeda-copilot-mcp://local-docs/SKILL.md';
@@ -78,6 +79,7 @@ export function createServer(bridge: Bridge) {
     registerProjectTools(server, bridge);
     registerExecuteJsTools(server, bridge);
     registerVerifyTools(server, bridge);
+    registerLabelTools(server, bridge);
 
     return server;
 }

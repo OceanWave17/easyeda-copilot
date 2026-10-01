@@ -23,6 +23,8 @@ export default defineConfig({
         'src/tools/execute-js.ts',
     ],
     format: ['esm'],
+    // Scripts that run inside EasyEDA are bundled verbatim as strings.
+    loader: { '.txt': 'text' },
     clean: true,
     dts: false,
     sourcemap: false,

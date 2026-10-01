@@ -1,0 +1,114 @@
+// Runs inside EasyEDA (execute-js). Input: inputs.options = JSON {dryRun, maxShift, step}.
+// Resolves overlapping text on the current schematic page without touching connectivity:
+//  1. hides a wire's net-name text when a port/flag of the same net sits on that wire;
+//  2. moves remaining overlapping texts (component designators/values, wire net names)
+//     to the nearest free spot. Port and flag symbols and all wires stay where they are.
+const options = JSON.parse(inputs.options || '{}');
+const dryRun = options.dryRun === true;
+const maxShift = options.maxShift ?? 40;
+const step = options.step ?? 5;
+const PAD = 0.5;
+
+const box = b => b && { x1: b.minX - PAD, y1: b.minY - PAD, x2: b.maxX + PAD, y2: b.maxY + PAD };
+const shift = (b, dx, dy) => ({ x1: b.x1 + dx, y1: b.y1 + dy, x2: b.x2 + dx, y2: b.y2 + dy });
+const hit = (a, b) => a.x1 < b.x2 && b.x1 < a.x2 && a.y1 < b.y2 && b.y1 < a.y2;
+const segHitsBox = (s, b) => {
+    const [x1, y1, x2, y2] = s;
+    if (x1 === x2) return x1 > b.x1 && x1 < b.x2 && Math.max(y1, y2) > b.y1 && Math.min(y1, y2) < b.y2;
+    if (y1 === y2) return y1 > b.y1 && y1 < b.y2 && Math.max(x1, x2) > b.x1 && Math.min(x1, x2) < b.x2;
+    return false;
+};
+const segments = line => {
+    const s = [];
+    for (let i = 0; i + 3 < line.length; i += 2) s.push([line[i], line[i + 1], line[i + 2], line[i + 3]]);
+    return s;
+};
+const bbox = async id => box(await eda.sch_Primitive.getPrimitivesBBox([id]));
+
+const texts = [];
+const bodies = [];
+const ports = [];
+for (const c of await eda.sch_PrimitiveComponent.getAll()) {
+    const type = c.getState_ComponentType();
+    if (type === 'sheet') continue;
+    const id = c.getState_PrimitiveId();
+    const isPort = type === 'netflag' || type === 'netport';
+    const attrs = await eda.sch_PrimitiveAttribute.getAll(id);
+    const net = isPort
+        ? (attrs.find(a => a.getState_Key() === 'Global Net Name')?.getState_Value() || c.getState_Name() || '')
+        : '';
+    const owner = c.getState_Designator() || `${type} ${net}`;
+    const body = await bbox(id);
+    if (body) bodies.push({ owner, b: body });
+    // A port's anchor sits on its wire end; its drawn body is offset from the anchor.
+    if (isPort) ports.push({ net, x: c.getState_X(), y: c.getState_Y() });
+    for (const a of attrs) {
+        if (!(a.getState_ValueVisible() || a.getState_KeyVisible())) continue;
+        const b = await bbox(a.getState_PrimitiveId());
+        if (b) texts.push({ id: a.getState_PrimitiveId(), owner, key: a.getState_Key(), movable: !isPort, b,
+            x: a.getState_X(), y: a.getState_Y() });
+    }
+}
+const wires = [];
+for (const w of await eda.sch_PrimitiveWire.getAll()) {
+    const net = w.getState_Net();
+    const segs = segments(w.getState_Line());
+    wires.push({ net, segs });
+    for (const a of await eda.sch_PrimitiveAttribute.getAll(w.getState_PrimitiveId())) {
+        if (!a.getState_ValueVisible()) continue;
+        const b = await bbox(a.getState_PrimitiveId());
+        if (b) texts.push({ id: a.getState_PrimitiveId(), owner: `wire ${net}`, key: 'NetName', wireNet: net, segs,
+            movable: true, b, x: a.getState_X(), y: a.getState_Y() });
+    }
+}
+const allSegs = wires.flatMap(w => w.segs.map(s => ({ net: w.net, s })));
+
+// Wire text may touch its own wire; component text may not touch any wire.
+const blocked = (t, b, skip) => {
+    if (texts.some(u => u !== t && !u.hidden && !skip.has(u) && hit(b, u.b))) return true;
+    if (bodies.some(o => o.owner !== t.owner && hit(b, o.b))) return true;
+    return allSegs.some(({ net, s }) => (t.wireNet === undefined || net !== t.wireNet) && segHitsBox(s, b));
+};
+const overlapping = () => texts.filter(t => !t.hidden && blocked(t, t.b, new Set()));
+const before = overlapping().length;
+
+// 1. Duplicate names: a visible port/flag of the same net touching the wire already shows it.
+let hidden = 0;
+for (const t of texts) {
+    if (t.key !== 'NetName') continue;
+    const port = ports.find(p => p.net === t.wireNet && t.segs.some(s =>
+        [[s[0], s[1]], [s[2], s[3]]].some(([x, y]) => Math.hypot(x - p.x, y - p.y) < 1)));
+    if (!port) continue;
+    t.hidden = true;
+    hidden++;
+    if (!dryRun) await eda.sch_PrimitiveAttribute.modify(t.id, { valueVisible: false });
+}
+
+// 2. Move what still overlaps to the nearest free offset.
+const offsets = [];
+for (let dx = -maxShift; dx <= maxShift; dx += step)
+    for (let dy = -maxShift; dy <= maxShift; dy += step)
+        if (dx || dy) offsets.push([dx, dy]);
+offsets.sort((a, b) => Math.hypot(...a) - Math.hypot(...b));
+
+let moved = 0;
+const unresolved = [];
+for (const t of overlapping()) {
+    if (!t.movable) { unresolved.push(`${t.owner}/${t.key}`); continue; }
+    const free = offsets.find(([dx, dy]) => !blocked(t, shift(t.b, dx, dy), new Set()));
+    if (!free) { unresolved.push(`${t.owner}/${t.key}`); continue; }
+    const [dx, dy] = free;
+    t.b = shift(t.b, dx, dy);
+    moved++;
+    if (!dryRun) await eda.sch_PrimitiveAttribute.modify(t.id, { x: t.x + dx, y: t.y + dy });
+}
+
+return {
+    dryRun,
+    texts: texts.length,
+    overlapping_before: before,
+    hidden_duplicate_net_names: hidden,
+    moved,
+    overlapping_after: overlapping().length,
+    unresolved,
+};
